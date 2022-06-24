@@ -2,6 +2,8 @@
 
 Type-aware _everything_ code search (for Go only (right now)).
 
+See the blog post for more: [https://nickgregory.me/post/2022/06/23/go-code-as-a-graph/](https://nickgregory.me/post/2022/06/23/go-code-as-a-graph/)
+
 ## Examples
 
 * `x` calls `y`
@@ -83,7 +85,7 @@ FOR callpkg in INBOUND callfunc Functions
 RETURN {package: callpkg.SourceURL, file: statement.File, text: statement.Text, var: var.Name, type: var.Type}
 ```
 
-Find all uses of `crypto/rsa.GenerateKey`, where the result flows through 0 or more intermediary variables to reach a `pem.Encode` call:
+Find all uses of `crypto/rsa.GenerateKey`, where the result flows through up to 3 intermediary variables to reach a `pem.Encode` call:
 ```
 // find calls to crypto/rsa.GenerateKey
 FOR p IN package
@@ -91,77 +93,43 @@ FILTER p.SourceURL == "crypto/rsa"
 FOR f IN OUTBOUND p Functions
 FILTER f.Name == "GenerateKey"
 FOR call IN INBOUND f Callee
-
-// Walk def->ref->def->ref->... until we reach a statement with an interesting call
 FOR srccallstmt IN OUTBOUND call CallSiteStatement
 
+// Walk assign->ref->assign->ref->...
+// until we reach a statement with an interesting call.
 // v "alternates" between being a variable and being a statement
-FOR v, e, path IN 1..5 OUTBOUND srccallstmt Assigns, INBOUND References
+
+FOR v, e, path IN 1..9 OUTBOUND srccallstmt Assigns, INBOUND References
     PRUNE CONTAINS(v.Text, "Encode")
     OPTIONS {uniqueVertices: "path"}
-    // ensure the "reference" if this is a statement is not actually an assignment
-    FILTER LENGTH(
-        FOR checkassign IN OUTBOUND v Assigns
-        FILTER path.vertices[*] ANY == checkassign
-        RETURN checkassign
-    ) == 0
-    FILTER CONTAINS(v.Text, "Encode")
-    RETURN path
-```
 
-# Comparison vs semgrep
+// ensure that the end vertex is where we want
+// quick check before doing any traversals
+FILTER CONTAINS(v.Text, "Encode")
+// now walk to the call site, called func,
+// and ensure it's actually encoding/pem.Encode
+FOR dstcallstmt IN INBOUND v CallSiteStatement
+FOR dstcallfunc IN OUTBOUND dstcallstmt Callee
+FILTER dstcallfunc.Name == "Encode"
+FOR dstcallpkg IN INBOUND dstcallfunc Functions
+FILTER dstcallpkg.SourceURL == "encoding/pem"
 
-## semgrep
-Rule definition
-
-```
-rules:
-- id: untitled_rule
-  pattern: |
-      binary.Read(..., &($X : []$Y))
-  message: Semgrep found a match
-  languages: [go]
-  severity: WARNING
-```
-
-```
-$ time semgrep --metrics=off -c /tmp/thing.yaml --verbose
-...
-====[ BEGIN error trace ]====
-Raised at Stdlib__map.Make.find in file "map.ml", line 137, characters 10-25
-Called from Sexplib0__Sexp_conv.Exn_converter.find_auto in file "src/sexp_conv.ml", line 156, characters 10-37
-=====[ END error trace ]=====
-...
-3374.64s user 505.06s system 143% cpu 44:59.79 total
-```
-Can't analyze all repos at once (maybe because it doesn't do subdirectory .gitignores?)
-
-one at a time:
-run time: XXXX
-
-```
-$ time for d in *; do semgrep --metrics=off -c /tmp/thing.yaml $d; done
-...
-8210.36s user 1246.15s system 115% cpu 2:16:59.63 total
-```
-
-## This
-Ingest time: ~11 hours
-Run time: ~20s
-
-```
-FOR p IN package
-FILTER p.SourceURL == "encoding/binary"
-FOR f IN OUTBOUND p Functions
-FILTER f.Name == "Read"
-FOR callsite IN INBOUND f Callee
-FOR statement IN OUTBOUND callsite CallSiteStatement
-FOR var IN OUTBOUND statement References
-FILTER STARTS_WITH(var.Type, "[]")
-FILTER CONTAINS(statement.Text, CONCAT("&", var.Name))
-FOR callfunc in INBOUND statement Statement
-FOR callpkg in INBOUND callfunc Functions
-RETURN {package: callpkg.SourceURL, file: statement.File, text: statement.Text, var: var.Name, type: var.Type}
-
-=> 628 elements
+// ensure the "reference" is not actually an assignment
+// go-graph considers a variable to be referenced
+// even if it's on the left-hand side of an assignment
+// which means `x, err := GenerateKey(); y, err := bar; Encode(y)`
+// would match without this last filter since `err` is assigned
+// in the first statement then also considered as "referenced"
+// in the second
+FILTER LENGTH(
+    FOR stmt IN path.vertices
+    FILTER IS_SAME_COLLECTION(statement, stmt)
+    FOR checkassign IN OUTBOUND stmt Assigns
+    FOR target IN path.vertices
+    FILTER IS_SAME_COLLECTION(variable, target)
+    FILTER POSITION(path.vertices, target, true) < POSITION(path.vertices, stmt, true)
+    FILTER target == checkassign
+    RETURN checkassign
+) == 0
+RETURN path
 ```
